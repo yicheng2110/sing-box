@@ -168,7 +168,7 @@ ob_save() {
         ob_error "更新配置失败，原配置未修改。"
         return 1
     fi
-    if ! "$is_core_bin" check -c "$tmp" -C "$is_conf_dir"; then
+    if ! "$is_core_bin" check -c "$tmp"; then
         rm -f "$tmp"
         ob_error "sing-box 配置校验失败，原配置未修改。"
         return 1
