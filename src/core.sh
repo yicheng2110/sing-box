@@ -44,6 +44,7 @@ mainmenu=(
     "帮助"
     "其他"
     "关于"
+    "出站与路由"
 )
 info_list=(
     "协议 (protocol)"
@@ -388,6 +389,11 @@ create() {
         fi
         is_outbounds='outbounds:[{tag:"direct",type:"direct"}]'
         is_server_config_json=$(jq "{$is_log,$is_dns,$is_ntp$is_outbounds}" <<<{})
+        if [[ -f $is_config_json ]]; then
+            is_server_config_json=$(jq --argjson base "$is_server_config_json" \
+                '. as $old | ($old.outbounds // []) as $outbounds | ($base * $old) | if any($outbounds[]?; .tag == "direct") then .outbounds = $outbounds else .outbounds = ($outbounds + $base.outbounds) end' \
+                "$is_config_json" 2>/dev/null) || err "无法读取现有配置文件，未修改: $is_config_json"
+        fi
         cat <<<$is_server_config_json >$is_config_json
         manage restart &
         ;;
@@ -1660,6 +1666,9 @@ is_main_menu() {
         load help.sh
         about
         ;;
+    11)
+        load outbound.sh
+        ;;
     esac
 }
 
@@ -1683,6 +1692,9 @@ main() {
     bbr)
         load bbr.sh
         _try_enable_bbr
+        ;;
+    outbound | route)
+        load outbound.sh
         ;;
     c | config | change)
         change ${@:2}
