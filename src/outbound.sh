@@ -131,34 +131,33 @@ ob_pick_rule() {
     ob_selected_rule=$(jq ".route.rules[$ob_index]" "$ob_config")
 }
 
-ob_edit_json() {
-    local value=$1 file editor
-    ob_json=$value
-    msg "\n4. 检查并修改生成的 JSON"
+ob_show_json() {
+    ob_json=$1
+    msg "\n配置预览："
     jq . <<<"$ob_json"
-    editor=${EDITOR:-vi}
-    file=$(mktemp) || {
-        ob_error "无法创建 JSON 临时文件。"
-        return 1
-    }
-    jq . <<<"$ob_json" >"$file"
-    if ! "$editor" "$file"; then
-        rm -f "$file"
-        ob_error "编辑器退出失败，操作已取消。"
-        return 1
-    fi
-    if ! jq -e 'type == "object"' "$file" >/dev/null 2>&1; then
-        rm -f "$file"
-        ob_error "JSON 无效，操作已取消。"
-        return 1
-    fi
-    ob_json=$(<"$file")
-    rm -f "$file"
+}
+
+ob_build_sniff_rule() {
+    local scope
+    msg "Sniff 规则范围："
+    msg "1) 指定入站"
+    msg "2) 全局"
+    echo -ne "请选择 [1-2]: "
+    IFS= read -r scope || return 1
+    case $scope in
+    1)
+        ob_pick_inbounds || return 1
+        ob_json=$(jq -n --argjson inbound "$ob_selected_inbounds" '{inbound:$inbound,action:"sniff",sniffer:["http","tls","quic"]}')
+        ;;
+    2) ob_json=$(jq -n '{action:"sniff",sniffer:["http","tls","quic"]}') ;;
+    *) msg "已取消。"; return 1 ;;
+    esac
 }
 
 ob_save() {
     local filter=$1 tmp backup mode
     shift
+    filter="$filter | if (.route.rules | type) == \"array\" then .route.rules |= (map(if has(\"outbound\") and (has(\"action\") | not) then . + {action:\"route\"} else . end) as \$rules | [\$rules[] | select(.action == \"sniff\")] + [\$rules[] | select(.action != \"sniff\")]) else . end"
     tmp=$(mktemp "${ob_config}.tmp.XXXXXX") || {
         ob_error "无法创建临时配置文件。"
         return 1
@@ -250,7 +249,7 @@ ob_read_outbound() {
 
     if [[ $current ]]; then
         [[ $username ]] && msg "当前用户名: $username"
-        echo -ne "用户名 (回车保留，输入 - 删除认证): "
+        echo -ne "用户名 (回车保留当前认证，输入 - 删除认证): "
         IFS= read -r answer || return 1
         if [[ $answer == - ]]; then
             username=
@@ -280,13 +279,202 @@ ob_read_outbound() {
     fi
     if [[ $current ]]; then
         ob_json=$(jq -n --argjson old "$current" --argjson generated "$ob_json" --arg remove_auth "$remove_auth" \
-            '$old * $generated | if $remove_auth == "1" or ($generated | has("username") | not) then del(.username, .password) else . end')
+            'if $old.type != $generated.type then ($old * $generated | if $generated.type == "http" then del(.network, .udp_over_tcp, .version) else del(.path, .headers, .version, .disable_version_fallback, .tls, .idle_timeout, .keep_alive_period, .stream_receive_window, .connection_receive_window, .max_concurrent_streams, .initial_packet_size, .disable_path_mtu_discovery) | .version = "5" end) else $old * $generated end | if $remove_auth == "1" then del(.username, .password) else . end')
     fi
-    ob_edit_json "$ob_json" || return 1
     jq -e '(.tag | type == "string" and length > 0) and (.type == "http" or .type == "socks") and (.server | type == "string" and length > 0) and (.server_port | type == "number" and . > 0 and . <= 65535)' <<<"$ob_json" >/dev/null || {
         ob_error "出站 JSON 缺少有效 tag、类型、服务器地址或端口。"
         return 1
     }
+    if jq -e 'has("username") != has("password")' <<<"$ob_json" >/dev/null; then
+        ob_error "认证必须同时提供 username 和 password。"
+        return 1
+    fi
+    ob_show_json "$ob_json"
+}
+
+ob_url_decode() {
+    local value=$1 encoded hex char
+    while [[ $value =~ %([[:xdigit:]]{2}) ]]; do
+        encoded=${BASH_REMATCH[0]}
+        hex=${BASH_REMATCH[1]}
+        printf -v char '%b' "\\x$hex"
+        value=${value/"$encoded"/"$char"}
+    done
+    ob_decoded=$value
+}
+
+ob_parse_link_host_port() {
+    local authority=$1
+    if [[ $authority =~ ^\[([^]]+)\]:([0-9]+)$ ]]; then
+        ob_server=${BASH_REMATCH[1]}
+        ob_port=${BASH_REMATCH[2]}
+    elif [[ $authority =~ ^([^:]+):([0-9]+)$ ]]; then
+        ob_server=${BASH_REMATCH[1]}
+        ob_port=${BASH_REMATCH[2]}
+    else
+        ob_error "链接中的服务器地址或端口格式无效。"
+        return 1
+    fi
+    while [[ ${#ob_port} -gt 1 && $ob_port == 0* ]]; do ob_port=${ob_port#0}; done
+    if [[ ${#ob_port} -gt 5 ]]; then
+        ob_error "链接端口必须在 1 到 65535 之间。"
+        return 1
+    fi
+    if ((ob_port < 1 || ob_port > 65535)); then
+        ob_error "链接端口必须在 1 到 65535 之间。"
+        return 1
+    fi
+}
+
+ob_parse_outbound_link() {
+    local url=$1 scheme remainder fragment query authority userinfo host_port decoded method password
+    local alpn insecure pin obfs obfs_password sni key value pair tag
+    local tls alpn_json pin_hex pin_base64 pin_byte ob_server ob_port i
+
+    url=${url#"${url%%[![:space:]]*}"}
+    url=${url%"${url##*[![:space:]]}"}
+    if [[ ! $url =~ ^([[:alpha:]][[:alnum:]+.-]*):// ]]; then
+        ob_error "请输入 Shadowsocks 或 Hysteria2 链接。"
+        return 1
+    fi
+    scheme=${BASH_REMATCH[1],,}
+    remainder=${url#*://}
+    fragment=
+    if [[ $remainder == *#* ]]; then
+        fragment=${remainder#*#}
+        remainder=${remainder%%#*}
+        ob_url_decode "$fragment"
+        fragment=$ob_decoded
+    fi
+    query=
+    if [[ $remainder == *\?* ]]; then
+        query=${remainder#*\?}
+        remainder=${remainder%%\?*}
+    fi
+    authority=$remainder
+
+    case $scheme in
+    ss)
+        if [[ $authority != *@* ]]; then
+            ob_error "Shadowsocks 链接缺少 Base64 凭据与服务器地址分隔符 @。"
+            return 1
+        fi
+        userinfo=${authority%%@*}
+        host_port=${authority#*@}
+        userinfo=${userinfo//-/+}
+        userinfo=${userinfo//_/\/}
+        while (( ${#userinfo} % 4 )); do userinfo+='='; done
+        if ! decoded=$(printf '%s' "$userinfo" | base64 --decode 2>/dev/null); then
+            ob_error "Shadowsocks 链接中的 Base64 凭据无效。"
+            return 1
+        fi
+        if [[ $decoded != *:* ]]; then
+            ob_error "Shadowsocks 凭据必须包含加密方法和密码。"
+            return 1
+        fi
+        method=${decoded%%:*}
+        password=${decoded#*:}
+        [[ $method && $password ]] || {
+            ob_error "Shadowsocks 加密方法和密码不能为空。"
+            return 1
+        }
+        ob_parse_link_host_port "$host_port" || return 1
+        tag=${fragment:-"ss-$ob_server-$ob_port"}
+        ob_json=$(jq -n --arg tag "$tag" --arg server "$ob_server" --argjson port "$ob_port" --arg method "$method" --arg password "$password" \
+            '{tag:$tag,type:"shadowsocks",server:$server,server_port:$port,method:$method,password:$password}')
+        ;;
+    hysteria2 | hy2)
+        if [[ $authority != *@* ]]; then
+            ob_error "Hysteria2 链接缺少密码与服务器地址分隔符 @。"
+            return 1
+        fi
+        userinfo=${authority%@*}
+        host_port=${authority##*@}
+        host_port=${host_port%/}
+        ob_url_decode "$userinfo"
+        password=$ob_decoded
+        [[ $password ]] || {
+            ob_error "Hysteria2 密码不能为空。"
+            return 1
+        }
+        ob_parse_link_host_port "$host_port" || return 1
+        alpn=
+        insecure=
+        pin=
+        obfs=
+        obfs_password=
+        sni=
+        while [[ $query ]]; do
+            pair=${query%%&*}
+            if [[ $query == *'&'* ]]; then query=${query#*'&'}; else query=; fi
+            [[ $pair == *=* ]] || continue
+            key=${pair%%=*}
+            value=${pair#*=}
+            ob_url_decode "$key"
+            key=$ob_decoded
+            ob_url_decode "$value"
+            value=$ob_decoded
+            case $key in
+            alpn) alpn=$value ;;
+            insecure | allowInsecure) insecure=$value ;;
+            pinSHA256) pin=$value ;;
+            obfs) obfs=$value ;;
+            obfs-password | obfs_password) obfs_password=$value ;;
+            sni | peer) sni=$value ;;
+            esac
+        done
+        tls=$(jq -n '{enabled:true}')
+        if [[ $alpn ]]; then
+            alpn_json=$(jq -Rn --arg value "$alpn" '$value | split(",") | map(select(length > 0))') || return 1
+            tls=$(jq --argjson alpn "$alpn_json" '. + {alpn:$alpn}' <<<"$tls")
+        fi
+        if [[ ${insecure,,} == 1 || ${insecure,,} == true ]]; then
+            tls=$(jq '. + {insecure:true}' <<<"$tls")
+        fi
+        if [[ $sni ]]; then
+            tls=$(jq --arg server_name "$sni" '. + {server_name:$server_name}' <<<"$tls")
+        fi
+        if [[ $pin ]]; then
+            pin_hex=${pin//:/}
+            if [[ ${#pin_hex} -eq 64 && $pin_hex =~ ^[[:xdigit:]]+$ ]]; then
+                pin_hex=${pin_hex,,}
+                pin_base64=$(for ((i = 0; i < 64; i += 2)); do printf '%b' "\\x${pin_hex:i:2}"; done | base64 -w 0)
+            elif [[ $pin =~ ^[A-Za-z0-9+/]+={0,2}$ ]] && printf '%s' "$pin" | base64 --decode >/dev/null 2>&1 && [[ $(printf '%s' "$pin" | base64 --decode 2>/dev/null | wc -c) -eq 32 ]]; then
+                pin_base64=$pin
+            else
+                ob_error "Hysteria2 pinSHA256 必须是 64 位十六进制指纹或 Base64 SHA-256。"
+                return 1
+            fi
+            tls=$(jq --arg pin "$pin_base64" '. + {certificate_sha256:[$pin]}' <<<"$tls")
+        fi
+        if [[ $obfs ]]; then
+            [[ $obfs_password ]] || {
+                ob_error "设置 Hysteria2 obfs 时必须同时提供 obfs-password。"
+                return 1
+            }
+            ob_json=$(jq -n --arg tag "${fragment:-hysteria2-$ob_server-$ob_port}" --arg server "$ob_server" --argjson port "$ob_port" --arg password "$password" --argjson tls "$tls" --arg obfs "$obfs" --arg obfs_password "$obfs_password" \
+                '{tag:$tag,type:"hysteria2",server:$server,server_port:$port,password:$password,tls:$tls,obfs:{type:$obfs,password:$obfs_password}}')
+        else
+            ob_json=$(jq -n --arg tag "${fragment:-hysteria2-$ob_server-$ob_port}" --arg server "$ob_server" --argjson port "$ob_port" --arg password "$password" --argjson tls "$tls" \
+                '{tag:$tag,type:"hysteria2",server:$server,server_port:$port,password:$password,tls:$tls}')
+        fi
+        ;;
+    *)
+        ob_error "暂不支持链接协议: $scheme。仅支持 ss://、hysteria2:// 和 hy2://。"
+        return 1
+        ;;
+    esac
+}
+
+ob_add_outbound_link() {
+    ob_read "粘贴 Shadowsocks 或 Hysteria2 链接: " || return 1
+    ob_parse_outbound_link "$ob_value" || return 1
+    ob_show_json "$ob_json"
+    if jq -e --arg tag "$(jq -r '.tag' <<<"$ob_json")" 'any(.outbounds[]?; .tag == $tag)' "$ob_config" >/dev/null; then
+        ob_error "出站名称已存在: $(jq -r '.tag' <<<"$ob_json")"
+        return 1
+    fi
+    ob_save '.outbounds += [$entry]' --argjson entry "$ob_json"
 }
 
 ob_add_outbound() {
@@ -322,7 +510,6 @@ ob_edit_outbound() {
 
 ob_add_rule() {
     local rule_type outbound set_final
-    ob_pick_inbounds || return
     msg "规则类型："
     msg "1) 将入站流量转发到出站"
     msg "2) 自定义规则（例如 sniff）"
@@ -330,6 +517,7 @@ ob_add_rule() {
     IFS= read -r rule_type || return
     case $rule_type in
     1)
+        ob_pick_inbounds || return
         ob_pick_outbound || return
         outbound=$ob_selected_tag
         [[ $outbound ]] || {
@@ -337,20 +525,24 @@ ob_add_rule() {
             return 1
         }
         ob_json=$(jq -n --argjson inbound "$ob_selected_inbounds" --arg outbound "$outbound" \
-            '{inbound:$inbound,outbound:$outbound}')
+            '{inbound:$inbound,action:"route",outbound:$outbound}')
         ;;
     2)
         outbound=
-        ob_json=$(jq -n --argjson inbound "$ob_selected_inbounds" \
-            '{inbound:$inbound,action:"sniff",sniffer:["http","tls","quic"]}')
+        ob_build_sniff_rule || return
         ;;
     *)
         msg "已取消。"
         return 1
         ;;
     esac
-    ob_edit_json "$ob_json" || return
+    ob_show_json "$ob_json"
     ob_validate_rule || return
+    if [[ $(jq -r '.action' <<<"$ob_json") == route ]]; then
+        outbound=$(jq -r '.outbound' <<<"$ob_json")
+    else
+        outbound=
+    fi
     if [[ $outbound ]]; then
         echo -ne "同时设为未匹配流量的默认出站？[y/N]: "
         IFS= read -r set_final
@@ -359,7 +551,7 @@ ob_add_rule() {
             return
         fi
     fi
-    ob_save '.route = (.route // {}) | .route.rules = (if ($rule | has("action")) then [$rule] + (.route.rules // []) else (.route.rules // []) + [$rule] end)' --argjson rule "$ob_json"
+    ob_save '.route = (.route // {}) | .route.rules = ((.route.rules // []) + [$rule])' --argjson rule "$ob_json"
 }
 
 ob_validate_rule() {
@@ -368,21 +560,27 @@ ob_validate_rule() {
         ob_error "规则必须是 JSON 对象。"
         return 1
     }
-    outbound=$(jq -r '.outbound // empty' <<<"$ob_json")
-    if [[ $outbound ]] && ! jq -e --arg tag "$outbound" 'any(.outbounds[]?; .tag == $tag)' "$ob_config" >/dev/null; then
-        ob_error "规则引用了不存在的出站 tag: $outbound"
-        return 1
+    if ! jq -e '.action | type == "string" and length > 0' <<<"$ob_json" >/dev/null; then
+        if jq -e 'has("outbound") and (has("action") | not)' <<<"$ob_json" >/dev/null; then
+            ob_json=$(jq '. + {action:"route"}' <<<"$ob_json")
+            msg "旧版 outbound 规则已自动迁移为 action=route。"
+        else
+            ob_error "规则必须包含非空 action 字段。"
+            return 1
+        fi
     fi
-    if ! jq -e 'has("action") or has("outbound")' <<<"$ob_json" >/dev/null; then
-        ob_error "规则必须包含 action 或 outbound。"
+    outbound=$(jq -r '.outbound // empty' <<<"$ob_json")
+    if [[ $(jq -r '.action' <<<"$ob_json") == route ]]; then
+        if ! jq -e '.outbound | type == "string" and length > 0' <<<"$ob_json" >/dev/null || ! jq -e --arg tag "$outbound" 'any(.outbounds[]?; .tag == $tag)' "$ob_config" >/dev/null; then
+            ob_error "route 规则必须引用一个有效的 outbound tag。"
+            return 1
+        fi
+    elif [[ $outbound ]]; then
+        ob_error "只有 action=route 的规则才能设置 outbound。"
         return 1
     fi
     if jq -e 'has("inbound")' <<<"$ob_json" >/dev/null; then
-        if ! jq -e '(.inbound | type) == "string" or (.inbound | type) == "array"' <<<"$ob_json" >/dev/null; then
-            ob_error "inbound 必须是 tag 字符串或字符串数组。"
-            return 1
-        fi
-        if ! jq -e '.inbound | if type == "array" then length > 0 else length > 0 end' <<<"$ob_json" >/dev/null; then
+        if ! jq -e '.inbound | if type == "array" then length > 0 and all(.[]; type == "string" and length > 0) else type == "string" and length > 0 end' <<<"$ob_json" >/dev/null; then
             ob_error "规则至少需要选择一个 inbound tag。"
             return 1
         fi
@@ -398,10 +596,35 @@ ob_validate_rule() {
 }
 
 ob_edit_rule() {
-    local rule_index
+    local rule_index rule_type outbound
     ob_pick_rule || return
     rule_index=$ob_index
-    ob_edit_json "$ob_selected_rule" || return
+    msg "规则类型："
+    msg "1) 将入站流量转发到出站"
+    msg "2) 协议嗅探 (sniff)"
+    echo -ne "请选择 [1-2]: "
+    IFS= read -r rule_type || return
+    case $rule_type in
+    1)
+        ob_pick_inbounds || return
+        ob_pick_outbound || return
+        outbound=$ob_selected_tag
+        [[ $outbound ]] || {
+            ob_error "目标出站没有 tag，无法设置转发规则。"
+            return 1
+        }
+        ob_json=$(jq -n --argjson inbound "$ob_selected_inbounds" --arg outbound "$outbound" \
+            '{inbound:$inbound,action:"route",outbound:$outbound}')
+        ;;
+    2)
+        ob_build_sniff_rule || return
+        ;;
+    *)
+        msg "已取消。"
+        return 1
+        ;;
+    esac
+    ob_show_json "$ob_json"
     ob_validate_rule || return
     ob_save '.route.rules[$index] = $rule' --argjson index "$rule_index" --argjson rule "$ob_json"
 }
@@ -431,6 +654,7 @@ outbound_menu() {
         msg "4) 编辑规则"
         msg "5) 删除出站"
         msg "6) 删除规则"
+        msg "7) 通过链接添加 Shadowsocks / Hysteria2 出站"
         msg "0) 返回"
         echo -ne "请选择: "
         IFS= read -r answer || return
@@ -441,8 +665,9 @@ outbound_menu() {
         4) ob_edit_rule ;;
         5) ob_delete_outbound ;;
         6) ob_delete_rule ;;
+        7) ob_add_outbound_link ;;
         0|'') return ;;
-        *) msg "请输入 0 到 6。" ;;
+        *) msg "请输入 0 到 7。" ;;
         esac
     done
 }
