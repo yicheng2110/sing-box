@@ -326,6 +326,14 @@ ob_parse_link_host_port() {
     fi
 }
 
+ob_core_supports_certificate_sha256() {
+    local version=${is_core_ver%%+*} major minor patch
+    [[ $version =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]] || return 1
+    major=${BASH_REMATCH[1]}
+    minor=${BASH_REMATCH[2]}
+    ((major > 1 || major == 1 && minor >= 15))
+}
+
 ob_parse_outbound_link() {
     local url=$1 scheme remainder fragment query authority userinfo host_port decoded method password
     local alpn insecure pin obfs obfs_password sni key value pair tag
@@ -445,7 +453,11 @@ ob_parse_outbound_link() {
                 ob_error "Hysteria2 pinSHA256 必须是 64 位十六进制指纹或 Base64 SHA-256。"
                 return 1
             fi
-            tls=$(jq --arg pin "$pin_base64" '. + {certificate_sha256:[$pin]}' <<<"$tls")
+            if ob_core_supports_certificate_sha256; then
+                tls=$(jq --arg pin "$pin_base64" '. + {certificate_sha256:[$pin]}' <<<"$tls")
+            else
+                msg "\n警告: sing-box ${is_core_ver:-当前版本} 不支持 Hysteria2 链接中的 pinSHA256，已忽略证书指纹固定。升级到 1.15.0 或更高版本后再导入，才能应用该指纹。"
+            fi
         fi
         if [[ $obfs ]]; then
             [[ $obfs_password ]] || {
